@@ -38,7 +38,8 @@ jobs:
 
   macos:
     needs: test
-    runs-on: macos-14
+    # macos-14 sering tidak mendapat runner (antrean arm64 penuh); macos-15 antrean terpisah.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with: { repository: SIDIGIT-23/sidigit-omr, ref: "${{ inputs.tag }}", token: "${{ secrets.SIDIGIT_TOKEN }}" }
