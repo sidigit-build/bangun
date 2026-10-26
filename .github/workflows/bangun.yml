@@ -1,0 +1,159 @@
+# Bangun installer SIDIGIT (macOS .dmg, Windows setup .exe, APK SIDIGIT Pindai) dari kode
+# sumber privat SIDIGIT-23/sidigit-omr, lalu terbitkan di Releases SIDIGIT-23/sidigit-rilis.
+#
+# Repo ini publik di organisasi sidigit-build sehingga GitHub Actions gratis. Kode sumber tetap
+# privat: diambil memakai secret SIDIGIT_TOKEN (fine-grained token milik SIDIGIT-23 —
+# sidigit-omr Contents: Read-only, sidigit-rilis Contents: Read and write), token yang sama
+# dipakai untuk menerbitkan rilis. Langkah build sama dengan release.yml di sidigit-omr.
+#
+# Jalankan: Actions › "Bangun & terbitkan SIDIGIT" › Run workflow › isi tag (mis. omr-v0.3.1),
+# atau  gh workflow run bangun.yml -R sidigit-build/bangun -f tag=omr-v0.3.1
+name: Bangun & terbitkan SIDIGIT
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag rilis di sidigit-omr (mis. omr-v0.3.1)"
+        required: true
+
+permissions: { contents: read }
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: SIDIGIT-23/sidigit-omr, ref: "${{ inputs.tag }}", token: "${{ secrets.SIDIGIT_TOKEN }}" }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  macos:
+    needs: test
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: SIDIGIT-23/sidigit-omr, ref: "${{ inputs.tag }}", token: "${{ secrets.SIDIGIT_TOKEN }}" }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "aarch64-apple-darwin,x86_64-apple-darwin" }
+      - uses: Swatinem/rust-cache@v2
+      - run: bash scripts/build-macos-universal.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sidigit-omr-macos-universal
+          path: |
+            dist/macos/*.dmg
+            dist/macos/*.zip
+
+  windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: SIDIGIT-23/sidigit-omr, ref: "${{ inputs.tag }}", token: "${{ secrets.SIDIGIT_TOKEN }}" }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "x86_64-pc-windows-msvc" }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p omr-core --locked
+      - name: Inno Setup
+        shell: pwsh
+        run: if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+      - shell: pwsh
+        run: ./scripts/build-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sidigit-omr-windows-x64
+          path: |
+            dist/windows/*-setup.exe
+            dist/windows/*.zip
+
+  android:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: SIDIGIT-23/sidigit-omr, ref: "${{ inputs.tag }}", token: "${{ secrets.SIDIGIT_TOKEN }}" }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android" }
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - uses: subosito/flutter-action@v2
+        with: { channel: stable, cache: true }
+      - name: Tes aplikasi Android
+        run: cd apps/sidigit_pindai && flutter pub get && flutter analyze && flutter test
+      - name: Build libsidigit_omr.so + APK SIDIGIT Pindai
+        run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}"
+          bash scripts/build-android.sh --apk
+          (cd dist/android && zip -r sidigit-omr-android-jniLibs.zip jniLibs)
+          for f in dist/android/app-*-release.apk; do mv "$f" "${f/app-/sidigit-pindai-}"; done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sidigit-omr-android
+          path: |
+            dist/android/*.zip
+            dist/android/*.apk
+
+  release:
+    needs: [macos, windows, android]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+      - uses: actions/checkout@v4
+        with: { repository: SIDIGIT-23/sidigit-omr, ref: "${{ inputs.tag }}", token: "${{ secrets.SIDIGIT_TOKEN }}", path: src }
+      - name: Catatan rilis dari pesan tag
+        working-directory: src
+        run: |
+          git fetch --force --depth=1 origin "+refs/tags/$TAG:refs/tags/$TAG"
+          git for-each-ref "refs/tags/$TAG" --format='%(contents)' | sed '/-----BEGIN PGP/,$d' > ../catatan.txt
+          cat ../catatan.txt
+      - name: update.json bertanda tangan (pemberitahuan pembaruan)
+        env:
+          SIDIGIT_UPDATE_KEY: ${{ secrets.SIDIGIT_UPDATE_KEY }}
+        run: |
+          if [ -z "$SIDIGIT_UPDATE_KEY" ]; then
+            echo "::warning::Secret SIDIGIT_UPDATE_KEY belum diisi — update.json tidak dibuat."
+            exit 0
+          fi
+          umask 077
+          printf '%s\n' "$SIDIGIT_UPDATE_KEY" > "$RUNNER_TEMP/kunci.pem"
+          python3 src/scripts/buat-update-json.py --tag "$TAG" --berkas artifacts \
+            --kunci "$RUNNER_TEMP/kunci.pem" --catatan catatan.txt --keluaran artifacts/update.json
+          rm -f "$RUNNER_TEMP/kunci.pem"
+          cat artifacts/update.json
+      - name: Checksum SHA-256
+        run: |
+          cd artifacts
+          find . -type f \( -name '*.dmg' -o -name '*-setup.exe' -o -name '*.zip' -o -name '*.apk' \) -exec sha256sum {} + | sed 's#  \./[^/]*/#  #' > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          repository: SIDIGIT-23/sidigit-rilis
+          token: ${{ secrets.SIDIGIT_TOKEN }}
+          tag_name: ${{ inputs.tag }}
+          target_commitish: main
+          name: SIDIGIT ${{ inputs.tag }}
+          body_path: catatan.txt
+          make_latest: "true"
+          fail_on_unmatched_files: false
+          files: |
+            artifacts/SHA256SUMS.txt
+            artifacts/**/*.dmg
+            artifacts/**/*-setup.exe
+            artifacts/**/*.zip
+            artifacts/**/*.apk
+            artifacts/update.json
