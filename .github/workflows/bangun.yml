@@ -28,7 +28,7 @@ env:
 
 jobs:
   test:
-    runs-on: macos-15
+    runs-on: macos-15-intel  # antrean arm64 (macos-14/15) sering penuh; target universal tetap dibangun
     steps:
       - uses: actions/checkout@v4
         with: { repository: SIDIGIT-23/sidigit-omr, ref: "${{ inputs.tag }}", token: "${{ secrets.SIDIGIT_TOKEN }}" }
@@ -38,8 +38,7 @@ jobs:
 
   macos:
     needs: test
-    # macos-14 sering tidak mendapat runner (antrean arm64 penuh); macos-15 antrean terpisah.
-    runs-on: macos-15
+    runs-on: macos-15-intel  # antrean arm64 (macos-14/15) sering penuh; target universal tetap dibangun
     steps:
       - uses: actions/checkout@v4
         with: { repository: SIDIGIT-23/sidigit-omr, ref: "${{ inputs.tag }}", token: "${{ secrets.SIDIGIT_TOKEN }}" }
