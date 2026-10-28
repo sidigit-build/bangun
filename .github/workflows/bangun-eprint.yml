@@ -1,4 +1,4 @@
-# Bangun installer E-Print Agent (Windows setup .exe + ZIP portabel) dari kode sumber privat
+# Bangun installer E-Print Agent (Windows setup .exe + ZIP, macOS .dmg + ZIP) dari kode sumber privat
 # SIDIGIT-23/eprint-agent, lalu terbitkan di Releases SIDIGIT-23/sidigit-rilis.
 #
 # Polanya sama dengan bangun.yml: repo ini publik sehingga Actions gratis; kode sumber diambil
@@ -46,8 +46,25 @@ jobs:
             dist/windows/*-setup.exe
             dist/windows/*.zip
 
+  macos:
+    runs-on: macos-15-intel  # antrean arm64 sering penuh; biner universal tetap dibangun
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: SIDIGIT-23/eprint-agent, ref: "${{ inputs.tag }}", token: "${{ secrets.SIDIGIT_TOKEN }}" }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "aarch64-apple-darwin,x86_64-apple-darwin" }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - run: bash scripts/build-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eprint-agent-macos-universal
+          path: |
+            dist/macos/*.dmg
+            dist/macos/*.zip
+
   release:
-    needs: windows
+    needs: [windows, macos]
     runs-on: ubuntu-latest
     env:
       TAG: ${{ inputs.tag }}
@@ -65,7 +82,7 @@ jobs:
       - name: Checksum SHA-256
         run: |
           cd artifacts
-          find . -type f \( -name '*-setup.exe' -o -name '*.zip' \) -exec sha256sum {} + | sed 's#  \./[^/]*/#  #' > SHA256SUMS-eprint.txt
+          find . -type f \( -name '*-setup.exe' -o -name '*.dmg' -o -name '*.zip' \) -exec sha256sum {} + | sed 's#  \./[^/]*/#  #' > SHA256SUMS-eprint.txt
           cat SHA256SUMS-eprint.txt
       - uses: softprops/action-gh-release@v2
         with:
@@ -80,4 +97,5 @@ jobs:
           files: |
             artifacts/SHA256SUMS-eprint.txt
             artifacts/**/*-setup.exe
+            artifacts/**/*.dmg
             artifacts/**/*.zip
