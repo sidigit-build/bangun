@@ -1,0 +1,83 @@
+# Bangun installer E-Print Agent (Windows setup .exe + ZIP portabel) dari kode sumber privat
+# SIDIGIT-23/eprint-agent, lalu terbitkan di Releases SIDIGIT-23/sidigit-rilis.
+#
+# Polanya sama dengan bangun.yml: repo ini publik sehingga Actions gratis; kode sumber diambil
+# memakai secret SIDIGIT_TOKEN (fine-grained token SIDIGIT-23 — perlu akses eprint-agent
+# Contents: Read-only, sidigit-rilis Contents: Read and write).
+#
+# Rilis E-Print TIDAK ditandai "Latest" agar tidak menggeser rilis SIDIGIT-OMR yang dipakai
+# halaman unduhan dan pemberitahuan pembaruan.
+#
+# Jalankan: Actions › "Bangun & terbitkan E-Print Agent" › Run workflow › isi tag (mis. eprint-v2.0.0),
+# atau  gh workflow run bangun-eprint.yml -R sidigit-build/bangun -f tag=eprint-v2.0.0
+name: Bangun & terbitkan E-Print Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag rilis di eprint-agent (mis. eprint-v2.0.0)"
+        required: true
+
+permissions: { contents: read }
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: SIDIGIT-23/eprint-agent, ref: "${{ inputs.tag }}", token: "${{ secrets.SIDIGIT_TOKEN }}" }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "x86_64-pc-windows-msvc" }
+      - uses: Swatinem/rust-cache@v2
+      - name: Inno Setup
+        shell: pwsh
+        run: if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+      # build-windows.ps1 menjalankan cargo test, build rilis, mengunduh SumatraPDF, lalu Inno Setup.
+      - shell: pwsh
+        run: ./scripts/build-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eprint-agent-windows-x64
+          path: |
+            dist/windows/*-setup.exe
+            dist/windows/*.zip
+
+  release:
+    needs: windows
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+      - uses: actions/checkout@v4
+        with: { repository: SIDIGIT-23/eprint-agent, ref: "${{ inputs.tag }}", token: "${{ secrets.SIDIGIT_TOKEN }}", path: src }
+      - name: Catatan rilis dari pesan tag
+        working-directory: src
+        run: |
+          git fetch --force --depth=1 origin "+refs/tags/$TAG:refs/tags/$TAG"
+          git for-each-ref "refs/tags/$TAG" --format='%(contents)' | sed '/-----BEGIN PGP/,$d' > ../catatan.txt
+          cat ../catatan.txt
+      - name: Checksum SHA-256
+        run: |
+          cd artifacts
+          find . -type f \( -name '*-setup.exe' -o -name '*.zip' \) -exec sha256sum {} + | sed 's#  \./[^/]*/#  #' > SHA256SUMS-eprint.txt
+          cat SHA256SUMS-eprint.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          repository: SIDIGIT-23/sidigit-rilis
+          token: ${{ secrets.SIDIGIT_TOKEN }}
+          tag_name: ${{ inputs.tag }}
+          target_commitish: main
+          name: E-Print Agent ${{ inputs.tag }}
+          body_path: catatan.txt
+          make_latest: "false"
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/SHA256SUMS-eprint.txt
+            artifacts/**/*-setup.exe
+            artifacts/**/*.zip
