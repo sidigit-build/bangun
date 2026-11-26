@@ -1,0 +1,230 @@
+# Bangun dan uji installer E-Print Sender (Windows setup .exe + ZIP, macOS .dmg + ZIP) dari kode
+# sumber privat SIDIGIT-23/eprint-sender. Bila "terbitkan" dicentang, hasilnya diterbitkan di
+# Releases SIDIGIT-23/sidigit-rilis.
+#
+# Polanya sama dengan bangun-eprint.yml: repo ini publik sehingga Actions gratis; kode sumber
+# diambil memakai secret SIDIGIT_TOKEN (fine-grained token SIDIGIT-23, perlu akses eprint-sender
+# Contents: Read-only, sidigit-rilis Contents: Read and write).
+#
+# Tiap build diuji dari ujung ke ujung di runner: installer dipasang, satu dokumen dicetak ke
+# printer virtual "E-Print SMPN 23", lalu dipastikan PDF-nya sampai ke server tiruan.
+#
+# Rilis TIDAK ditandai "Latest" agar tidak menggeser rilis SIDIGIT-OMR.
+#
+# Jalankan:  gh workflow run bangun-eprint-sender.yml -R sidigit-build/bangun -f ref=main
+#   terbit:  gh workflow run bangun-eprint-sender.yml -R sidigit-build/bangun -f ref=eprint-sender-v1.0.0 -f terbitkan=true
+name: Bangun & uji E-Print Sender
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Cabang atau tag di eprint-sender (rilis: eprint-sender-v1.0.0)"
+        required: true
+        default: main
+      terbitkan:
+        description: "Terbitkan ke Releases sidigit-rilis (ref harus berupa tag)"
+        type: boolean
+        default: false
+
+permissions: { contents: read }
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: SIDIGIT-23/eprint-sender, ref: "${{ inputs.ref }}", token: "${{ secrets.SIDIGIT_TOKEN }}" }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "x86_64-pc-windows-msvc" }
+      - uses: Swatinem/rust-cache@v2
+      - name: Inno Setup
+        shell: pwsh
+        run: if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+      # build-windows.ps1 menjalankan cargo test, build rilis, lalu Inno Setup.
+      - shell: pwsh
+        run: ./scripts/build-windows.ps1
+
+      - name: Pasang lewat installer
+        shell: powershell
+        run: |
+          Set-Service -Name Spooler -StartupType Manual
+          Start-Service -Name Spooler
+          $out = Join-Path $env:RUNNER_TEMP "uji"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $setup = (Get-ChildItem dist\windows\*-setup.exe | Select-Object -First 1).FullName
+          $p = Start-Process $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=$out\pasang.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content "$out\pasang.log" -Tail 40; throw "Installer keluar dengan kode $($p.ExitCode)" }
+          Get-Printer | Format-Table Name, DriverName, PortName -AutoSize
+          if (-not (Get-Printer -Name "E-Print SMPN 23" -ErrorAction SilentlyContinue)) { Get-Content "$out\pasang.log" -Tail 60; throw "Installer tidak memasang printer virtual." }
+          if (-not (Test-Path "$env:ProgramFiles\E-Print Sender SMPN 23\EPrintSender.exe")) { throw "EPrintSender.exe tidak terpasang." }
+
+      - name: Cetak dan kirim
+        shell: powershell
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "uji"
+          $exe = "$env:ProgramFiles\E-Print Sender SMPN 23\EPrintSender.exe"
+          $mock = Start-Process python -ArgumentList "tools\mock_unggah.py", "--port", "8770", "--token", "uji", "--simpan", "$out\unggahan", "--gagal", "1" `
+            -RedirectStandardOutput "$out\mock.log" -RedirectStandardError "$out\mock.err" -PassThru -NoNewWindow
+          $env:EPRINT_SENDER_HOST = "http://127.0.0.1:8770"
+          $env:EPRINT_SENDER_TOKEN = "uji"
+          $env:EPRINT_SENDER_DATA_DIR = "$out\data"
+          $sender = Start-Process $exe -ArgumentList "--headless", "--sekali" -RedirectStandardOutput "$out\sender.log" -RedirectStandardError "$out\sender.err" -PassThru -NoNewWindow
+          $null = $sender.Handle
+          Start-Sleep -Seconds 3
+
+          "Uji cetak E-Print Sender`r`nBaris kedua`r`n$(Get-Date -Format o)" | Out-Printer -Name "E-Print SMPN 23"
+          Write-Host "Dokumen dikirim ke printer virtual."
+
+          $selesai = $sender.WaitForExit(120000)
+          if (-not $selesai) { Write-Host "Sender belum selesai setelah 120 detik."; $sender.Kill() }
+          Write-Host "== log sender"; Get-Content "$out\sender.log", "$out\sender.err" -ErrorAction SilentlyContinue
+          Write-Host "== log server tiruan"; Get-Content "$out\mock.log", "$out\mock.err" -ErrorAction SilentlyContinue
+          $state = Invoke-RestMethod http://127.0.0.1:8770/mock/state
+          Stop-Process -Id $mock.Id -Force -ErrorAction SilentlyContinue
+          Write-Host "== diterima server tiruan"; $state.jobs | Format-List
+
+          if (-not $selesai -or $sender.ExitCode -ne 0) { throw "GAGAL: sender keluar dengan kode $($sender.ExitCode)." }
+          if ($state.jobs.Count -ne 1) { throw "GAGAL: server tiruan menerima $($state.jobs.Count) dokumen, seharusnya 1." }
+          $pdf = Join-Path $out "unggahan\job-1.pdf"
+          $awal = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($pdf), 0, 5)
+          if ($awal -ne "%PDF-") { throw "GAGAL: berkas yang diterima bukan PDF (awal: $awal)." }
+          Write-Host "LULUS: '$($state.jobs[0].file_name)' ($($state.jobs[0].bytes) byte) diterima server tiruan."
+
+      - name: Copot lewat uninstaller
+        shell: powershell
+        run: |
+          $unins = "$env:ProgramFiles\E-Print Sender SMPN 23\unins000.exe"
+          $p = Start-Process $unins -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait -PassThru
+          Start-Sleep -Seconds 5
+          if (Get-Printer -Name "E-Print SMPN 23" -ErrorAction SilentlyContinue) { throw "Printer masih terpasang setelah dicopot." }
+          if (Test-Path "$env:ProgramData\EPrintSender\spool") { throw "Folder spool masih ada setelah dicopot." }
+          Write-Host "LULUS: printer, port, dan folder spool tercopot."
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hasil-uji-windows
+          path: ${{ runner.temp }}/uji
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eprint-sender-windows-x64
+          path: |
+            dist/windows/*-setup.exe
+            dist/windows/*.zip
+
+  macos:
+    runs-on: macos-15-intel  # antrean arm64 sering penuh; biner universal tetap dibangun
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: SIDIGIT-23/eprint-sender, ref: "${{ inputs.ref }}", token: "${{ secrets.SIDIGIT_TOKEN }}" }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "aarch64-apple-darwin,x86_64-apple-darwin" }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - run: bash scripts/build-macos.sh
+
+      - name: Pasang printer, cetak, dan kirim
+        run: |
+          set -u
+          OUT="$RUNNER_TEMP/uji"; mkdir -p "$OUT"
+          APP="dist/macos/E-Print Sender.app/Contents/MacOS/EPrintSender"
+          python3 tools/mock_unggah.py --port 8770 --token uji --simpan "$OUT/unggahan" --gagal 1 > "$OUT/mock.log" 2>&1 &
+          MOCK=$!
+          EPRINT_SENDER_DATA_DIR="$OUT/data" EPRINT_SENDER_HOST=http://127.0.0.1:8770 EPRINT_SENDER_TOKEN=uji "$APP" --headless --sekali > "$OUT/sender.log" 2>&1 &
+          SENDER=$!
+          sleep 3
+
+          echo "== pasang printer"
+          "$APP" --pasang-printer || sudo "$APP" --pasang-printer
+          lpstat -v || true
+          lpstat -p EPrint_SMPN23 -l || true
+
+          echo "== cetak"
+          python3 tools/contoh_pdf.py "$OUT/uji.pdf" "Uji cetak E-Print Sender macOS"
+          lp -d EPrint_SMPN23 -t "Uji CI macOS.docx" "$OUT/uji.pdf"
+
+          for i in $(seq 1 120); do kill -0 $SENDER 2>/dev/null || break; sleep 1; done
+          if kill -0 $SENDER 2>/dev/null; then echo "Sender belum selesai setelah 120 detik."; kill $SENDER; KODE=99; else wait $SENDER; KODE=$?; fi
+          echo "== log sender"; cat "$OUT/sender.log"
+          echo "== log server tiruan"; cat "$OUT/mock.log"
+          echo "== antrean CUPS"; lpstat -o || true; lpstat -p EPrint_SMPN23 || true
+          curl -s http://127.0.0.1:8770/mock/state > "$OUT/state.json" || true
+          kill $MOCK 2>/dev/null || true
+          echo "== diterima server tiruan"; cat "$OUT/state.json"; echo
+          if [ "$KODE" != "0" ]; then
+            echo "== log galat CUPS"; sudo tail -n 60 /var/log/cups/error_log || true
+            echo "GAGAL: sender keluar dengan kode $KODE."; exit 1
+          fi
+          python3 - "$OUT" <<'PY'
+          import json, sys
+          out = sys.argv[1]
+          jobs = json.load(open(out + "/state.json"))["jobs"]
+          assert len(jobs) == 1, f"server tiruan menerima {len(jobs)} dokumen, seharusnya 1"
+          data = open(out + "/unggahan/job-1.pdf", "rb").read()
+          assert data.startswith(b"%PDF-"), "berkas yang diterima bukan PDF"
+          print(f"LULUS: '{jobs[0]['file_name']}' ({jobs[0]['bytes']} byte) diterima server tiruan.")
+          PY
+
+          echo "== copot printer"
+          "$APP" --copot-printer || sudo "$APP" --copot-printer
+          if lpstat -v EPrint_SMPN23 2>/dev/null; then echo "GAGAL: printer masih terpasang."; exit 1; fi
+          echo "LULUS: printer tercopot."
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hasil-uji-macos
+          path: ${{ runner.temp }}/uji
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eprint-sender-macos-universal
+          path: |
+            dist/macos/*.dmg
+            dist/macos/*.zip
+
+  release:
+    if: ${{ inputs.terbitkan }}
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.ref }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts, pattern: "eprint-sender-*" }
+      - uses: actions/checkout@v4
+        with: { repository: SIDIGIT-23/eprint-sender, ref: "${{ inputs.ref }}", token: "${{ secrets.SIDIGIT_TOKEN }}", path: src }
+      - name: Catatan rilis dari pesan tag
+        working-directory: src
+        run: |
+          case "$TAG" in eprint-sender-v*) ;; *) echo "ref '$TAG' bukan tag eprint-sender-vX.Y.Z"; exit 1 ;; esac
+          git fetch --force --depth=1 origin "+refs/tags/$TAG:refs/tags/$TAG"
+          git for-each-ref "refs/tags/$TAG" --format='%(contents)' | sed '/-----BEGIN PGP/,$d' > ../catatan.txt
+          cat ../catatan.txt
+      - name: Checksum SHA-256
+        run: |
+          cd artifacts
+          find . -type f \( -name '*-setup.exe' -o -name '*.dmg' -o -name '*.zip' \) -exec sha256sum {} + | sed 's#  \./[^/]*/#  #' > SHA256SUMS-eprint-sender.txt
+          cat SHA256SUMS-eprint-sender.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          repository: SIDIGIT-23/sidigit-rilis
+          token: ${{ secrets.SIDIGIT_TOKEN }}
+          tag_name: ${{ inputs.ref }}
+          target_commitish: main
+          name: E-Print Sender ${{ inputs.ref }}
+          body_path: catatan.txt
+          make_latest: "false"
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/SHA256SUMS-eprint-sender.txt
+            artifacts/**/*-setup.exe
+            artifacts/**/*.dmg
+            artifacts/**/*.zip
